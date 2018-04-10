@@ -53,8 +53,11 @@ class EncoderDecoder(chainer.Chain):
                 anoInput = decoderOutList[i - 1]
             hOut = self.decLSTM(F.concat([decEmbed[i], anoInput], 1))
             lstmStateList[i] = self.get_state()
-            decoderOutList[i] = hOut #TODO 今だけ
+            decoderOutList[i] = attention(hOut)
         return (lstmStateList, decoderOutList)
+
+    def attention(self, hOut):
+        return hOut
     
     def getEmbeddings(self, sentenceList, args):
         sentenceLen = [len(sentence) for sentence in sentenceList]
