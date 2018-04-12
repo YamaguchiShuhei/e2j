@@ -33,10 +33,13 @@ class EncoderDecoder(chainer.Chain):
                 self.attnOut = L.Linear(args.hiddenDim+args.hiddenDim, args.hiddenDim, nobias=True)
 
     def trainBatch(self, encSents, decSents, args):
+        """main training"""
+        ###encoder step
         encEmbed = self.getEmbeddings(encSents, args)
         hy, cy, ys = self.encNStepLSTM(hx=None, cx=None, xs=encEmbed)
-        ys = F.pad_sequence(ys).transpose([1, 0, 2])
+        ys = F.pad_sequence(ys) #[batch, max(sentlen), Dim]
 
+        ###decoder step
         decEmbed = self.getEmbeddings(decSents, args) #embed のリストの状態
         decEmbed = F.pad_sequence(decEmbed).transpose([1, 0, 2]) #padding して[sentLen, batch, Dim]に変更
 
@@ -51,13 +54,67 @@ class EncoderDecoder(chainer.Chain):
             else:
                 self.set_state(lstmStateList[i - 1])
                 anoInput = decoderOutList[i - 1]
-            hOut = self.decLSTM(F.concat([decEmbed[i], anoInput], 1))
+            hOut = self.decLSTM(F.concat([decEmbed[i], anoInput], 1)) #decoder LSTMの出力
             lstmStateList[i] = self.get_state()
-            decoderOutList[i] = attention(hOut)
+            decoderOutList[i] = attention(hOut, ys, args) #decoder LSTMの出力をアテンションしたもの decoderの出力 decod_step * [batch, Dim]
+
+        correctLabels = F.pad_sequence(decSents, padding=-1).T.array #TODO 何か嫌だから上手く書きたい　ってかこの関数全体何か汚い -1でパディングしたから1足したら0がeosトークンになるんじゃね？
+        for i in range(decod_step):
+            oVector = self.decOut(F.dropout(decoderOutList[i], args.dropout_rate))
+            correctLabel = correctLabels[i + 1]
+
+            proc += (xp.count_nonzero(correctLabel + 1)) ###TODO 0を数えてたらunkトークンがなくなるし、1足したら全部1以上になるンゴ
+            # 必ずminibatchsizeでわる
+            closs = chaFunc.softmax_cross_entropy(
+                oVector, correctLabel, normalize=False) #多分だけどnormalize=Falseのため、minibatchsizeで割る必要性が出てくる?
+            # これで正規化なしのloss  cf. seq2seq-attn code
+            total_loss_val += closs.data * cMBSize
+            if train_mode > 0:  # 学習データのみ backward する
+                total_loss += closs
+            # 実際の正解数を獲得したい
+            t_correct = 0
+            t_incorrect = 0
+            # Devのときは必ず評価，学習データのときはオプションに従って評価
+            if train_mode == 0 or args.doEvalAcc > 0:
+                # 予測した単語のID配列 CuPy
+                pred_arr = oVector.data.argmax(axis=1)
+                # 正解と予測が同じなら0になるはず
+                # => 正解したところは0なので，全体から引く ###xp.count_nonzero()は間違えた数？
+                t_correct = (correctLabel.size -
+                             xp.count_nonzero(correctLabel - pred_arr)) #t_correct正解した数
+                # 予測不要の数から正解した数を引く # +1はbroadcast
+                t_incorrect = xp.count_nonzero(correctLabel + 1) - t_correct #xp.count_nonzero()は予測する必要のある数 つまりt_incorrectは間違えた数
+            correct += t_correct
+            incorrect += t_incorrect
+        ####
+        if train_mode > 0:  # 学習時のみ backward する 学習するのはvalじゃない方　valは.dataだから当たり前か
+            total_loss.backward()
+
+        return total_loss_val, (correct, incorrect, decoder_proc, proc)
+            
+        ### output層
         return (lstmStateList, decoderOutList)
 
-    def attention(self, hOut):
-        return hOut
+    def attention(self, hOut, ys, args): #TODO この関数も何か汚い
+        """calc attention"""
+        if args.attention == 0: #アテンションをしない時hOutをそのまま返す
+            return hOut
+        #ターゲット側の下準備
+        hOut1 = self.attnIn(hOut) #[batch, Dim]
+        hOut2 = F.expand_dims(hOut1, axis=1) #[batch, 1, Dim]
+        hOut3 = F.broadcast_to(hOut2, (len(hOut2), len(ys[0]), args.hiddenDim)) #[batch, max(enc_sentlen), Dim] 今ysとhOut3は同じshapeのはず
+
+        aval = F.sum(ys*hOut3, axis=2) #[batch, sentlen]
+
+        cAttn1 = F.softmax(aval) #[batch, max(enc_sentlen)] paddingで0のところはかなり小さい数字の確率で出てくる
+        cAttn2 = F.expand_dims(cAttn1, axis=1) #[batch, 1, max(enc_sentlen)]
+        cAttn3 = F.batch_matmul(cAttn2, ys) #[batch, 1, Dim]
+        context = F.reshape(cAttn3, (len(ys), len(ys[0][0]))) #[batch, Dim] エンコーダコンテキストベクトルの完成
+
+        c1 = F.concat((hOut, context)) #[batch, Dim + Dim]
+        c2 = self.attnOut(c2) #[bathc, Dim]
+        return F.tanh(c2) #活性化
+        
     
     def getEmbeddings(self, sentenceList, args):
         sentenceLen = [len(sentence) for sentence in sentenceList]
@@ -70,6 +127,7 @@ class EncoderDecoder(chainer.Chain):
 
     def get_state(self):
         return [self.decLSTM.c, self.decLSTM.h]
+    
 
 class PrepareData:
     def __init__(self, args):
