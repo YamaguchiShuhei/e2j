@@ -58,6 +58,7 @@ class EncoderDecoder(chainer.Chain):
             lstmStateList[i] = self.get_state()
             decoderOutList[i] = attention(hOut, ys, args) #decoder LSTMの出力をアテンションしたもの decoderの出力 decod_step * [batch, Dim]
 
+        ###output層
         correctLabels = F.pad_sequence(decSents, padding=-1).T.array #TODO 何か嫌だから上手く書きたい　ってかこの関数全体何か汚い -1でパディングしたから1足したら0がeosトークンになるんじゃね？
         for i in range(decod_step):
             oVector = self.decOut(F.dropout(decoderOutList[i], args.dropout_rate))
@@ -66,7 +67,7 @@ class EncoderDecoder(chainer.Chain):
             proc += (xp.count_nonzero(correctLabel + 1)) ###TODO 0を数えてたらunkトークンがなくなるし、1足したら全部1以上になるンゴ
             # 必ずminibatchsizeでわる
             closs = chaFunc.softmax_cross_entropy(
-                oVector, correctLabel, normalize=False) #多分だけどnormalize=Falseのため、minibatchsizeで割る必要性が出てくる?
+                oVector, correctLabel, normalize=False) #normalize=Falseの意味？ paddingしてるからっぽい
             # これで正規化なしのloss  cf. seq2seq-attn code
             total_loss_val += closs.data * cMBSize
             if train_mode > 0:  # 学習データのみ backward する
@@ -92,9 +93,6 @@ class EncoderDecoder(chainer.Chain):
 
         return total_loss_val, (correct, incorrect, decoder_proc, proc)
             
-        ### output層
-        return (lstmStateList, decoderOutList)
-
     def attention(self, hOut, ys, args): #TODO この関数も何か汚い
         """calc attention"""
         if args.attention == 0: #アテンションをしない時hOutをそのまま返す
