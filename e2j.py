@@ -37,7 +37,7 @@ class EncoderDecoder(chainer.Chain):
         ###encoder step
         encEmbed = self.getEmbeddings(encSents, args)
         hy, cy, ys = self.encNStepLSTM(hx=None, cx=None, xs=encEmbed)
-        ys = F.pad_sequence(ys) #[batch, max(sentlen), Dim]
+        encOut = F.pad_sequence(ys) #[batch, max(sentlen), Dim]
 
         ###decoder step
         decEmbed = self.getEmbeddings(decSents, args) #embed のリストの状態
@@ -48,6 +48,7 @@ class EncoderDecoder(chainer.Chain):
         lstmStateList = [0] * decode_step
         firstInput = chainer.Variable(xp.zeros(hy[0].shape, dtype=xp.float32)) #decLSTMの最初に入力として初期化 embedじゃない方
         for i in range(decode_step):
+            #decEmbedじゃないdecLSTMへの入力の準備と、decLSTMのstate準備
             if i == 0: #デコーダの最初のステップ
                 self.set_state([cy[0], hy[0]])
                 anoInput = firstInput
@@ -56,7 +57,7 @@ class EncoderDecoder(chainer.Chain):
                 anoInput = decoderOutList[i - 1]
             hOut = self.decLSTM(F.concat([decEmbed[i], anoInput], 1)) #decoder LSTMの出力
             lstmStateList[i] = self.get_state()
-            decoderOutList[i] = self.attention(hOut, ys, args) #decoder LSTMの出力をアテンションしたもの decoderの出力 decode_step * [batch, Dim]
+            decoderOutList[i] = self.attention(hOut, encOut, args) #decoder LSTMの出力をアテンションしたもの decoderの出力 decode_step * [batch, Dim]
 
         total_loss = chainer.Variable(xp.zeros((), dtype=xp.float32))
         proc = 0
@@ -96,21 +97,21 @@ class EncoderDecoder(chainer.Chain):
 
         return total_loss, (correct, incorrect, decode_step, proc)
             
-    def attention(self, hOut, ys, args): #TODO この関数も何か汚い
+    def attention(self, hOut, encOut, args): #TODO この関数も何か汚い
         """calc attention"""
         if args.attention == 0: #アテンションをしない時hOutをそのまま返す
             return hOut
         #ターゲット側の下準備
         hOut1 = self.attnIn(hOut) #[batch, Dim]
         hOut2 = F.expand_dims(hOut1, axis=1) #[batch, 1, Dim]
-        hOut3 = F.broadcast_to(hOut2, (len(hOut2), len(ys[0]), args.hiddenDim)) #[batch, max(enc_sentlen), Dim] 今ysとhOut3は同じshapeのはず
+        hOut3 = F.broadcast_to(hOut2, (len(hOut2), len(encOut[0]), args.hiddenDim)) #[batch, max(enc_sentlen), Dim] 今encOutとhOut3は同じshapeのはず
 
-        aval = F.sum(ys*hOut3, axis=2) #[batch, sentlen]
+        aval = F.sum(encOut*hOut3, axis=2) #[batch, sentlen]
 
         cAttn1 = F.softmax(aval) #[batch, max(enc_sentlen)] paddingで0のところはかなり小さい数字の確率で出てくる
         cAttn2 = F.expand_dims(cAttn1, axis=1) #[batch, 1, max(enc_sentlen)]
-        cAttn3 = F.batch_matmul(cAttn2, ys) #[batch, 1, Dim]
-        context = F.reshape(cAttn3, (len(ys), len(ys[0][0]))) #[batch, Dim] エンコーダコンテキストベクトルの完成
+        cAttn3 = F.batch_matmul(cAttn2, encOut) #[batch, 1, Dim]
+        context = F.reshape(cAttn3, (len(encOut), len(encOut[0][0]))) #[batch, Dim] エンコーダコンテキストベクトルの完成
 
         c1 = F.concat((hOut, context)) #[batch, Dim + Dim]
         c2 = self.attnOut(c1) #[bathc, Dim]
@@ -192,7 +193,124 @@ class EncoderDecoderUpdater(training.StandardUpdater):
         optimizer.target.cleargrads()
         loss.backward()
         optimizer.update()
-        
+
+
+def updateBeamThreshold__2(queue, input):
+    ####これ早いの？　普通にlambda使ってソートすれば良くない？　そこまで差がでるんかな
+    # list内の要素はlist,タプル，かつ，0番目の要素はスコアを仮定
+    if len(queue) == 0:
+        queue.append(input)
+    else:
+        # TODO 線形探索なのは面倒なので 効率を上げるためには要修正
+        for i in six.moves.range(len(queue)):
+            if queue[i][0] <= input[0]:
+                continue
+            tmp = queue[i]
+            queue[i] = input
+            input = tmp
+    return queue
+
+
+def BeamDecording(model, encSent, decDict, decDictR, args): #1文ずつ処理していく　beamの時にbatch処理になるため、
+    """docording by beam search"""
+    # train_mode = 0  # 評価なので
+    # エンコードゾーン
+    encEmbed = model.getEmbeddings([encSent], args) #list[1, array[sent, Dim]]
+    hy, cy, ys = model.encNStepLSTM(hx=None, cx=None, xs=encEmbed)
+    encOut = F.pad_sequence(ys) #[batch(1), max(sentlen), Dim]
+
+    idx_bos = decDict["<bos>"]
+    idx_eos = decDict["<eos>"]
+    
+    anoInput = chainer.Variable(xp.zeros(hy[0].shape, dtype=xp.float32)) #anoInputで最初の入力
+    beam = [(0, [idx_bos], idx_bos, cy[0], hy[0], anoInput)] #beam_searchの最初のagenda agenda内(スコア, 予測単語列, 1つ前の予測単語, 前のLSTMstatecy, hy, encLSTMに入るもうひとつの入力)
+    empty = (1.0e+100, [idx_bos], idx_bos, None, None) #新しいbeamを作る時の空agenda
+
+
+    beam_size = args.beam_size
+    for i in six.moves.range(args.decode_len + 1):
+        newBeam = [empty] * beam_size #次のbeamになる候補たち、最初は空agenda
+
+        batch_size = len(beam) #batch_sizeは最初異なるから
+        encOut = F.broadcast_to(encOut, (batch_size, len(encOut[0]), args.hDim)) #[beam(batch), encsentlen, Dim] 入力文は1つだけどbeamをバッチとして考える エンコーダの出力をbatchだけ伸ばす
+        zipbeam= list(six.moves.zip(*beam)) #転地
+
+        lstm_cy = F.concat(zipbeam[3], axist=0) #(スコア, 予測単語列, 1つ前の予測単語, 前のLSTMstate_cy, hy, encLSTMに入るもうひとつの入力) 前のcyをコンカット
+        lstm_hy = F.concat(zipbeam[4], axist=0) #hyのconcat
+        model.set_state(lstm_cy, lstm_hy) #一つ前のbeamに入ってるlstmstateをセッティング
+        # concat(a, axis=0) == vstack(a)
+        anoInput = F.concat(zipbeam[5], axis=0) #anoInputのconcat [batch, Dim]
+        # 一つ前の予測単語からdecoderの入力取得
+        wordIndex = xp.array(zipbeam[2], dtype=np.int32) #[batch]
+        decInput = model.getEmbeddings([wordIndex], args)[0] #[batch, Dim]]
+
+        hOut = model.decLSTM(F.concat([decInput, anoInput], 1)) #decoder LSTMの出力
+        lstmState = model.get_state()
+        decOut = model.attention(hOut, encOut, args) #decoder LSTMの出力をアテンションしたもの decoderの出力 decode_step * [batch, Dim]
+        oVector = model.decOut(decOut)
+
+        nextWordProb = -F.log_softmax(oVector_a.data).data #予測単語
+
+        nextWordProb[:, idx_bos] = 1.0e+100
+        sortedIndex = xp.argsort(nextWordProb_a)[:, :beam_size]
+
+        #agenda内(スコア, 予測単語列, 1つ前の予測単語, 前のLSTMstatecy, hy, encLSTMに入るもうひとつの入力)
+        for z, b in enumerate(beam):
+            if b[2] == idx_eos: # 修了単語
+                newBeam = updateBeamThreshold__2(newBeam, b)
+                continue
+
+            if i != args.decode_len and b[0] > newBeam[-1][0]: ####まだ最後じゃない　かつ　beam内のやつのほうがしょぼいならここで修了 newに入れてあげる価値無し
+                continue
+            # 3
+            # 次のbeamを作るために準備
+            cy = lstmState[0][z:z+1, ] #こうやって書くとexpand_dimしなくていい？
+            hy = lstmState[1][z:z+1, ]
+            next_ano = decOut[z:z + 1, ]
+            nannka = nextWordProb[z]
+            # 長さ制約的にEOSを選ばなくてはいけないという場合
+            if i == args.decode_len:
+                wordIndex = idx_eos
+                newProb = nextWordProb[wordIndex] + b[0] ####スコアに長さ制約の関係でeosシンボルスコアがたされる
+                nb = (newProb, b[1][:] + [wordIndex], wordIndex,
+                      lstm_states, next_h4, tWFilter) ####beam内の今見てたbを更新してnbとした
+                newBeam = updateBeamThreshold__2(newBeam, nb) ####nbがnewBeamに入れるかどうかの試験
+                continue
+            # 3
+            # ここまでたどり着いたら最大beam個評価する
+            # 基本的に sortedIndex_a[z] は len(beam) 個しかない
+            for wordIndex in sortedIndex_a[z]: ####sortedIndex_a [beam, beam(batch)] のfor z, b in enumerate に入る前に作ってたencoderの予測高いtopBのやつ
+                newProb = nextWordProb[wordIndex] + b[0]
+                if newProb > newBeam[-1][0]: ####newbeam の中の最低スコアより低いならばここでおしまいだ
+                    continue
+                    # break
+                # ここまでたどり着いたら入れる
+                if args.wo_rep_w:
+                    tWFilter = b[5].copy()
+                    tWFilter[:, wordIndex] += 1.0e+100 ####もしかして同じ奴が次出現しないようにしてるのか？ そういうことか　でもいらない時もあるよな
+                else:
+                    tWFilter = b[5]
+                nb = (newProb, b[1][:] + [wordIndex], wordIndex,
+                      lstm_states, next_h4, tWFilter)
+                newBeam = updateBeamThreshold__2(newBeam, nb) ####また判定してるんごおおおおお
+                #####
+        ################
+        # 一時刻分の処理が終わったら，入れ替える
+        beam = newBeam
+        if all([True if b[2] == idx_eos else False for b in beam]): ####beam内の全ての前の単語がeosになったら終わろうか
+            break
+        # 次の入力へ
+    beam = [(b[0], b[1], b[3], b[4], [EncDecAtt.index2decoderWord[z]
+                                      if z != 0
+                                      else "$UNK$"
+                                      for z in b[1]]) for b in beam] ####beam内いろいろとindex単語列を単語列に変換したものに変更
+    ####多分　beam内の各要素説明(謎スコア, 予測単語列, 一個前の予測単語, decLSTMに渡すlstmのstate, decLSTMに入るinputEmbじゃない方(attしてるやつ), フィルター(出力単語を一部制御))
+    return beam
+
+
+def rerankingByLengthNormalizedLoss(beam, wposi):
+    beam.sort(key=lambda b: b[0] / (len(b[wposi]) - 1))
+    return beam
     
 if __name__ == "__main__":
     """main program"""
@@ -275,6 +393,12 @@ if __name__ == "__main__":
         default=1,
         type=int,
         help='beam size in beam search decoding default=1')
+    parser.add_argument(
+        '--decode-len'
+        dest='decode_len'
+        default=70,
+        type=int,
+        help='max length while decoding')
         
     print("start")
     args = parser.parse_args()
@@ -326,18 +450,18 @@ if __name__ == "__main__":
     print("finish init")
     batch = trainIter.next()
     updater = EncoderDecoderUpdater(trainIter, optimizer, args)
-    trainer = training.Trainer(updater, (2, "epoch"))
+    trainer = training.Trainer(updater, (5, "epoch"))
     trainer.extend(extensions.ProgressBar(update_interval=1))
-    trainer.run()
+    # trainer.run()
     ##### ここから下はupdaterに書くことになるかもな TODO
-    # es = [xp.array(x[0], dtype=xp.int32) for x in batch]
-    # ds = [xp.array(x[1], dtype=xp.int32) for x in batch]
+    es = [xp.array(x[0], dtype=xp.int32) for x in batch]
+    ds = [xp.array(x[1], dtype=xp.int32) for x in batch]
 
-    # encEmbed = model.getEmbeddings(es, args)
-    # hy, cy, ys = model.encNStepLSTM(hx=None, cx=None, xs=encEmbed)
-    # decEmbed = F.pad_sequence(model.getEmbeddings(ds, args)).transpose([1, 0, 2])
+    encEmbed = model.getEmbeddings(es, args)
+    hy, cy, ys = model.encNStepLSTM(hx=None, cx=None, xs=encEmbed)
+    decEmbed = F.pad_sequence(model.getEmbeddings(ds, args)).transpose([1, 0, 2])
     
-    # loss, result = model.trainBatch(es, ds, args)
+    loss, result = model.trainBatch(es, ds, args)
 
     print("Fin")
             
