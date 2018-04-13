@@ -118,10 +118,10 @@ class EncoderDecoder(chainer.Chain):
         
     
     def getEmbeddings(self, sentenceList, args):
-        sentenceLen = [len(sentence) for sentence in sentenceList]
-        sentenceSection = xp.cumsum(sentenceLen[:-1])
+        sentenceLen = xp.array([len(sentence) for sentence in sentenceList])
+        sentenceSection = xp.cumsum(sentenceLen[:-1]).tolist()
         sentenceEmbed = F.dropout(self.encEmbed(F.concat(sentenceList, axis=0)), args.dropout_rate)
-        return F.split_axis(sentenceEmbed, sentenceSection, 0, force_tuple=True)
+        return F.split_axis(sentenceEmbed, sentenceSection, axis=0, force_tuple=True)
 
     def set_state(self, state):
         self.decLSTM.set_state(state[0], state[1])
@@ -170,6 +170,30 @@ class PrepareData:
         return [(eS, dS) for eS, dS in zip(encSentList, decSentList)]
 
     
+class EncoderDecoderUpdater(training.StandardUpdater):
+    """model updater"""
+    def __init__(self, train_iter, optimizer, args):
+        super(EncoderDecoderUpdater, self).__init__(
+            train_iter,
+            optimizer,
+        )
+
+    def update_core(self):
+        train_iter = self.get_iterator("main")
+        optimizer = self.get_optimizer("main")
+
+        batch = train_iter.__next__()
+
+        encSents = [xp.array(x[0], dtype=xp.int32) for x in batch]
+        decSents = [xp.array(x[1], dtype=xp.int32) for x in batch]
+
+        loss, _ = optimizer.target.trainBatch(encSents, decSents, args)
+
+        optimizer.target.cleargrads()
+        loss.backward()
+        optimizer.update()
+        
+    
 if __name__ == "__main__":
     """main program"""
     parser = argparse.ArgumentParser()
@@ -178,11 +202,11 @@ if __name__ == "__main__":
         dest='gpu',
         default=0,
         type=int,
-        help='GPU ID for model')
+        help='GPU ID')
     parser.add_argument(
         '-T',
         '--train-test-mode',
-        dest='train_mode',
+        dest='mode',
         default='train',
         help='select train or test')
     parser.add_argument(
@@ -191,7 +215,7 @@ if __name__ == "__main__":
         dest='embedDim',
         default=512,
         type=int,
-        help='dimensions of embedding layers in both encoder/decoder ')
+        help='dimensions of embedding layers in both encoder/decoder [int] default=512')
     parser.add_argument(
         '-H',
         '--hidden-dim',
@@ -216,12 +240,12 @@ if __name__ == "__main__":
     parser.add_argument(
         '--enc-data',
         dest='encDataFile',
-        default='./datasets/300k_train/train.en',
+        default='./datasets/10k_train/train.en',
         help='filename for encoder training')
     parser.add_argument(
         '--dec-data-file',
         dest='decDataFile',
-        default='./datasets/300k_train/train.ja',
+        default='./datasets/10k_train/train.ja',
         help='filename for decoder trainig')
     parser.add_argument(
         '--enc-devel-data-file',
@@ -262,18 +286,16 @@ if __name__ == "__main__":
     else:
         import numpy as xp
         args.gpu = -1
-    ###変更せよ TODO
-    xp = np
     xp.random.seed(0)
     random.seed(0)
 
-    if args.train_mode == 'train':
+    if args.mode == 'train':
         chainer.global_config.train = True
         chainer.global_config.enable_backprop = True
         chainer.global_config.use_cudnn = "always"
         chainer.global_config.type_check = True
         #train_model(args)
-    elif args.train_mode == 'test':
+    elif args.mode == 'test':
         chainer.global_config.train = False
         chainer.global_config.enable_backprop = False
         chainer.global_config.use_cudnn = "always"
@@ -298,17 +320,24 @@ if __name__ == "__main__":
     trainIter = iterators.SerialIterator(ppD.makeInput(encSentList, decSentList), args.batch_size, repeat=True, shuffle=True)
 
     model = EncoderDecoder(encDict, decDict, args)
+    model.to_gpu()
+    optimizer = optimizers.Adam()
+    optimizer.setup(model)
     print("finish init")
-    ##### ここから下はupdaterに書くことになるかもな TODO
     batch = trainIter.next()
-    es = [xp.array(x[0], dtype=xp.int32) for x in batch]
-    ds = [xp.array(x[1], dtype=xp.int32) for x in batch]
+    updater = EncoderDecoderUpdater(trainIter, optimizer, args)
+    trainer = training.Trainer(updater, (2, "epoch"))
+    trainer.extend(extensions.ProgressBar(update_interval=1))
+    trainer.run()
+    ##### ここから下はupdaterに書くことになるかもな TODO
+    # es = [xp.array(x[0], dtype=xp.int32) for x in batch]
+    # ds = [xp.array(x[1], dtype=xp.int32) for x in batch]
 
-    encEmbed = model.getEmbeddings(es, args)
-    hy, cy, ys = model.encNStepLSTM(hx=None, cx=None, xs=encEmbed)
-    decEmbed = F.pad_sequence(model.getEmbeddings(ds, args)).transpose([1, 0, 2])
-
+    # encEmbed = model.getEmbeddings(es, args)
+    # hy, cy, ys = model.encNStepLSTM(hx=None, cx=None, xs=encEmbed)
+    # decEmbed = F.pad_sequence(model.getEmbeddings(ds, args)).transpose([1, 0, 2])
     
+    # loss, result = model.trainBatch(es, ds, args)
 
     print("Fin")
             
