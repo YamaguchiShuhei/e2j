@@ -43,11 +43,11 @@ class EncoderDecoder(chainer.Chain):
         decEmbed = self.getEmbeddings(decSents, args) #embed のリストの状態
         decEmbed = F.pad_sequence(decEmbed).transpose([1, 0, 2]) #padding して[sentLen, batch, Dim]に変更
 
-        decod_step = len(decEmbed) - 1
-        decoderOutList = [0] * decod_step
-        lstmStateList = [0] * decod_step
+        decode_step = len(decEmbed) - 1
+        decoderOutList = [0] * decode_step
+        lstmStateList = [0] * decode_step
         firstInput = chainer.Variable(xp.zeros(hy[0].shape, dtype=xp.float32)) #decLSTMの最初に入力として初期化 embedじゃない方
-        for i in range(decod_step):
+        for i in range(decode_step):
             if i == 0: #デコーダの最初のステップ
                 self.set_state([cy[0], hy[0]])
                 anoInput = firstInput
@@ -56,42 +56,45 @@ class EncoderDecoder(chainer.Chain):
                 anoInput = decoderOutList[i - 1]
             hOut = self.decLSTM(F.concat([decEmbed[i], anoInput], 1)) #decoder LSTMの出力
             lstmStateList[i] = self.get_state()
-            decoderOutList[i] = attention(hOut, ys, args) #decoder LSTMの出力をアテンションしたもの decoderの出力 decod_step * [batch, Dim]
+            decoderOutList[i] = self.attention(hOut, ys, args) #decoder LSTMの出力をアテンションしたもの decoderの出力 decode_step * [batch, Dim]
 
+        total_loss = chainer.Variable(xp.zeros((), dtype=xp.float32))
+        proc = 0
+        correct = 0
+        incorrect = 0
         ###output層
         correctLabels = F.pad_sequence(decSents, padding=-1).T.array #TODO 何か嫌だから上手く書きたい　ってかこの関数全体何か汚い -1でパディングしたから1足したら0がeosトークンになるんじゃね？
-        for i in range(decod_step):
+        for i in range(decode_step):
             oVector = self.decOut(F.dropout(decoderOutList[i], args.dropout_rate))
             correctLabel = correctLabels[i + 1]
 
             proc += (xp.count_nonzero(correctLabel + 1)) ###TODO 0を数えてたらunkトークンがなくなるし、1足したら全部1以上になるンゴ
             # 必ずminibatchsizeでわる
-            closs = chaFunc.softmax_cross_entropy(
+            closs = F.softmax_cross_entropy(
                 oVector, correctLabel, normalize=False) #normalize=Falseの意味？ paddingしてるからっぽい
             # これで正規化なしのloss  cf. seq2seq-attn code
-            total_loss_val += closs.data * cMBSize
-            if train_mode > 0:  # 学習データのみ backward する
-                total_loss += closs
+            #total_loss_val += closs.data * cMBSize
+            #if train_mode > 0:  # 学習データのみ backward する
+            total_loss += closs
             # 実際の正解数を獲得したい
             t_correct = 0
             t_incorrect = 0
             # Devのときは必ず評価，学習データのときはオプションに従って評価
-            if train_mode == 0 or args.doEvalAcc > 0:
-                # 予測した単語のID配列 CuPy
-                pred_arr = oVector.data.argmax(axis=1)
-                # 正解と予測が同じなら0になるはず
-                # => 正解したところは0なので，全体から引く ###xp.count_nonzero()は間違えた数？
-                t_correct = (correctLabel.size -
-                             xp.count_nonzero(correctLabel - pred_arr)) #t_correct正解した数
-                # 予測不要の数から正解した数を引く # +1はbroadcast
-                t_incorrect = xp.count_nonzero(correctLabel + 1) - t_correct #xp.count_nonzero()は予測する必要のある数 つまりt_incorrectは間違えた数
+            # if train_mode == 0 or args.doEvalAcc > 0:
+            # 予測した単語のID配列 CuPy
+            pred_arr = oVector.data.argmax(axis=1)
+            # 正解と予測が同じなら0になるはず
+            # => 正解したところは0なので，全体から引く ###xp.count_nonzero()は間違えた数？
+            t_correct = (correctLabel.size -
+                         xp.count_nonzero(correctLabel - pred_arr)) #t_correct正解した数
+            # 予測不要の数から正解した数を引く # +1はbroadcast
+            t_incorrect = xp.count_nonzero(correctLabel + 1) - t_correct #xp.count_nonzero()は予測する必要のある数 つまりt_incorrectは間違えた数
             correct += t_correct
             incorrect += t_incorrect
         ####
-        if train_mode > 0:  # 学習時のみ backward する 学習するのはvalじゃない方　valは.dataだから当たり前か
-            total_loss.backward()
+        #total_loss.backward()
 
-        return total_loss_val, (correct, incorrect, decoder_proc, proc)
+        return total_loss, (correct, incorrect, decode_step, proc)
             
     def attention(self, hOut, ys, args): #TODO この関数も何か汚い
         """calc attention"""
@@ -110,7 +113,7 @@ class EncoderDecoder(chainer.Chain):
         context = F.reshape(cAttn3, (len(ys), len(ys[0][0]))) #[batch, Dim] エンコーダコンテキストベクトルの完成
 
         c1 = F.concat((hOut, context)) #[batch, Dim + Dim]
-        c2 = self.attnOut(c2) #[bathc, Dim]
+        c2 = self.attnOut(c1) #[bathc, Dim]
         return F.tanh(c2) #活性化
         
     
@@ -173,7 +176,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--gpu',
         dest='gpu',
-        default=1,
+        default=0,
         type=int,
         help='GPU ID for model')
     parser.add_argument(
@@ -251,14 +254,14 @@ if __name__ == "__main__":
         
     print("start")
     args = parser.parse_args()
-    # if args.gpu >= 0:
-    #     import cupy as xp
-    #     cuda.check_cuda_available()
-    #     cuda.get_device(args.gpu).use()
-    #     print(args.gpu)
-    # else:
-    #     import numpy as xp
-    #     args.gpu = -1
+    if args.gpu >= 0:
+        import cupy as xp
+        cuda.check_cuda_available()
+        cuda.get_device(args.gpu).use()
+        print("gpu number", args.gpu)
+    else:
+        import numpy as xp
+        args.gpu = -1
     ###変更せよ TODO
     xp = np
     xp.random.seed(0)
@@ -305,7 +308,7 @@ if __name__ == "__main__":
     hy, cy, ys = model.encNStepLSTM(hx=None, cx=None, xs=encEmbed)
     decEmbed = F.pad_sequence(model.getEmbeddings(ds, args)).transpose([1, 0, 2])
 
-
+    
 
     print("Fin")
             
