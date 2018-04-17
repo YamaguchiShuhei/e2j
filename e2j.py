@@ -285,7 +285,7 @@ def BeamDecording(model, encSent, decDict, args): #1文ずつ処理していく�
                     continue
                     # break
                 # ここまでたどり着いたら入れる
-                nb = (newProb, b[1][:] + [wordIndex], wordIndex,
+                nb = (newProb, b[1][:] + [wordIndex.tolist()], wordIndex,
                       cy, hy, next_ano) #(スコア, 予測単語列, 1つ前の予測単語, 前のLSTMstate_cy, hy, encLSTMに入るもうひとつの入力)
                 newBeam = updateBeamThreshold__2(newBeam, nb) ####また判定してるんごおおおおお
                 #####
@@ -305,7 +305,17 @@ def rerankingByLengthNormalizedLoss(beam, wposi):
     return beam
 
 # BeamDecording(model, encSent, decDict, decDictR, args): #1文ずつ処理していく　beamの時にbatch処理になるため、
-def demo(model, encSent, decDict, decDictR, args):
+def demo(model, encSents, decSents, encDictR, decDict, decDictR, args):
+    for encSent, decSent in zip(encSents, decSents):
+        print("Ques", " ".join([encDictR[z] if z != 0 else "<unk>" for z in encSent.tolist()]))
+        print("gold", "".join([decDictR[z] if z != 0 else "<unk>" for z in decSent.tolist()]))
+        beam = BeamDecording(model, encSent, decDict, args)
+        for i, b in enumerate(beam):
+            print("pred", i, b[0], "".join([decDictR[z] if z != 0 else "<unk>" for z in b[1]]))
+        print("----------------------------------------------------")
+            
+            
+            
     
 if __name__ == "__main__":
     """main program"""
@@ -445,9 +455,9 @@ if __name__ == "__main__":
     print("finish init")
     batch = trainIter.next()
     updater = EncoderDecoderUpdater(trainIter, optimizer, args)
-    trainer = training.Trainer(updater, (5, "epoch"))
+    trainer = training.Trainer(updater, (args.epoch, "epoch"))
     trainer.extend(extensions.ProgressBar(update_interval=1))
-    # trainer.run()
+    trainer.run()
     ##### ここから下はupdaterに書くことになるかもな TODO
     es = [xp.array(x[0], dtype=xp.int32) for x in batch]
     ds = [xp.array(x[1], dtype=xp.int32) for x in batch]
@@ -463,3 +473,6 @@ if __name__ == "__main__":
 def train_model(args):
     return 0
 
+##
+# serializers.save_npz("locate", model)
+# serializers.load_npz("locate", model)
