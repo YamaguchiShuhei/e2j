@@ -1,6 +1,5 @@
 import sys
 import collections
-import six.moves.cPickle as pickle
 import copy
 import numpy as np
 import argparse
@@ -202,7 +201,7 @@ def updateBeamThreshold__2(queue, input):
         queue.append(input)
     else:
         # TODO 線形探索なのは面倒なので 効率を上げるためには要修正
-        for i in six.moves.range(len(queue)):
+        for i in range(len(queue)):
             if queue[i][0] <= input[0]:
                 continue
             tmp = queue[i]
@@ -211,7 +210,7 @@ def updateBeamThreshold__2(queue, input):
     return queue
 
 
-def BeamDecording(model, encSent, decDict, decDictR, args): #1文ずつ処理していく　beamの時にbatch処理になるため、
+def BeamDecording(model, encSent, decDict, args): #1文ずつ処理していく　beamの時にbatch処理になるため、
     """docording by beam search"""
     # train_mode = 0  # 評価なので
     # エンコードゾーン
@@ -224,20 +223,20 @@ def BeamDecording(model, encSent, decDict, decDictR, args): #1文ずつ処理し
     
     anoInput = chainer.Variable(xp.zeros(hy[0].shape, dtype=xp.float32)) #anoInputで最初の入力
     beam = [(0, [idx_bos], idx_bos, cy[0], hy[0], anoInput)] #beam_searchの最初のagenda agenda内(スコア, 予測単語列, 1つ前の予測単語, 前のLSTMstatecy, hy, encLSTMに入るもうひとつの入力)
-    empty = (1.0e+100, [idx_bos], idx_bos, None, None) #新しいbeamを作る時の空agenda
+    empty = (1.0e+100, [idx_bos], idx_bos, None, None, None) #新しいbeamを作る時の空agenda
 
 
     beam_size = args.beam_size
-    for i in six.moves.range(args.decode_len + 1):
+    for i in range(args.decode_len + 1):
         newBeam = [empty] * beam_size #次のbeamになる候補たち、最初は空agenda
 
         batch_size = len(beam) #batch_sizeは最初異なるから
-        encOut = F.broadcast_to(encOut, (batch_size, len(encOut[0]), args.hDim)) #[beam(batch), encsentlen, Dim] 入力文は1つだけどbeamをバッチとして考える エンコーダの出力をbatchだけ伸ばす
-        zipbeam= list(six.moves.zip(*beam)) #転地
+        encOut = F.broadcast_to(encOut, (batch_size, len(encOut[0]), args.hiddenDim)) #[beam(batch), encsentlen, Dim] 入力文は1つだけどbeamをバッチとして考える エンコーダの出力をbatchだけ伸ばす
+        zipbeam= list(zip(*beam)) #転地
 
-        lstm_cy = F.concat(zipbeam[3], axist=0) #(スコア, 予測単語列, 1つ前の予測単語, 前のLSTMstate_cy, hy, encLSTMに入るもうひとつの入力) 前のcyをコンカット
-        lstm_hy = F.concat(zipbeam[4], axist=0) #hyのconcat
-        model.set_state(lstm_cy, lstm_hy) #一つ前のbeamに入ってるlstmstateをセッティング
+        lstm_cy = F.concat(zipbeam[3], axis=0) #(スコア, 予測単語列, 1つ前の予測単語, 前のLSTMstate_cy, hy, encLSTMに入るもうひとつの入力) 前のcyをコンカット
+        lstm_hy = F.concat(zipbeam[4], axis=0) #hyのconcat
+        model.set_state([lstm_cy, lstm_hy]) #一つ前のbeamに入ってるlstmstateをセッティング
         # concat(a, axis=0) == vstack(a)
         anoInput = F.concat(zipbeam[5], axis=0) #anoInputのconcat [batch, Dim]
         # 一つ前の予測単語からdecoderの入力取得
@@ -246,13 +245,13 @@ def BeamDecording(model, encSent, decDict, decDictR, args): #1文ずつ処理し
 
         hOut = model.decLSTM(F.concat([decInput, anoInput], 1)) #decoder LSTMの出力
         lstmState = model.get_state()
-        decOut = model.attention(hOut, encOut, args) #decoder LSTMの出力をアテンションしたもの decoderの出力 decode_step * [batch, Dim]
-        oVector = model.decOut(decOut)
+        decOuts = model.attention(hOut, encOut, args) #decoder LSTMの出力をアテンションしたもの decoderの出力 decode_step * [batch, Dim]
+        oVector = model.decOut(decOuts)
 
-        nextWordProb = -F.log_softmax(oVector_a.data).data #予測単語
+        nextWordProb = -F.log_softmax(oVector.data).data #予測単語
 
         nextWordProb[:, idx_bos] = 1.0e+100
-        sortedIndex = xp.argsort(nextWordProb_a)[:, :beam_size]
+        sortedIndex = xp.argsort(nextWordProb)[:, :beam_size] #[beam(batch), beam] beam毎の各要素に対してbeam個の候補を用意してる
 
         #agenda内(スコア, 予測単語列, 1つ前の予測単語, 前のLSTMstatecy, hy, encLSTMに入るもうひとつの入力)
         for z, b in enumerate(beam):
@@ -266,32 +265,28 @@ def BeamDecording(model, encSent, decDict, decDictR, args): #1文ずつ処理し
             # 次のbeamを作るために準備
             cy = lstmState[0][z:z+1, ] #こうやって書くとexpand_dimしなくていい？
             hy = lstmState[1][z:z+1, ]
-            next_ano = decOut[z:z + 1, ]
-            nannka = nextWordProb[z]
+            next_ano = decOuts[z:z+1, ]
             # 長さ制約的にEOSを選ばなくてはいけないという場合
             if i == args.decode_len:
                 wordIndex = idx_eos
-                newProb = nextWordProb[wordIndex] + b[0] ####スコアに長さ制約の関係でeosシンボルスコアがたされる
+                newProb = nextWordProb[z][wordIndex] + b[0] ####スコアに長さ制約の関係でeosシンボルスコアがたされる
                 nb = (newProb, b[1][:] + [wordIndex], wordIndex,
-                      lstm_states, next_h4, tWFilter) ####beam内の今見てたbを更新してnbとした
+                      cy, hy, next_ano) ####beam内の今見てたbを更新してnbとした
                 newBeam = updateBeamThreshold__2(newBeam, nb) ####nbがnewBeamに入れるかどうかの試験
                 continue
             # 3
             # ここまでたどり着いたら最大beam個評価する
             # 基本的に sortedIndex_a[z] は len(beam) 個しかない
-            for wordIndex in sortedIndex_a[z]: ####sortedIndex_a [beam, beam(batch)] のfor z, b in enumerate に入る前に作ってたencoderの予測高いtopBのやつ
-                newProb = nextWordProb[wordIndex] + b[0]
+            for wordIndex in sortedIndex[z]: ####sortedIndex_a [beam, beam(batch)] のfor z, b in enumerate に入る前に作ってたencoderの予測高いtopBのやつ
+                newProb = nextWordProb[z][wordIndex] + b[0]
+                #return (newBeam, newProb, nextWordProb, sortedIndex)
+                # import pdb; pdb.set_trace()
                 if newProb > newBeam[-1][0]: ####newbeam の中の最低スコアより低いならばここでおしまいだ
                     continue
                     # break
                 # ここまでたどり着いたら入れる
-                if args.wo_rep_w:
-                    tWFilter = b[5].copy()
-                    tWFilter[:, wordIndex] += 1.0e+100 ####もしかして同じ奴が次出現しないようにしてるのか？ そういうことか　でもいらない時もあるよな
-                else:
-                    tWFilter = b[5]
                 nb = (newProb, b[1][:] + [wordIndex], wordIndex,
-                      lstm_states, next_h4, tWFilter)
+                      cy, hy, next_ano) #(スコア, 予測単語列, 1つ前の予測単語, 前のLSTMstate_cy, hy, encLSTMに入るもうひとつの入力)
                 newBeam = updateBeamThreshold__2(newBeam, nb) ####また判定してるんごおおおおお
                 #####
         ################
@@ -300,10 +295,7 @@ def BeamDecording(model, encSent, decDict, decDictR, args): #1文ずつ処理し
         if all([True if b[2] == idx_eos else False for b in beam]): ####beam内の全ての前の単語がeosになったら終わろうか
             break
         # 次の入力へ
-    beam = [(b[0], b[1], b[3], b[4], [EncDecAtt.index2decoderWord[z]
-                                      if z != 0
-                                      else "$UNK$"
-                                      for z in b[1]]) for b in beam] ####beam内いろいろとindex単語列を単語列に変換したものに変更
+    beam = [(b[0], b[1]) for b in beam] ####beam内いろいろとindex単語列を単語列に変換したものに変更
     ####多分　beam内の各要素説明(謎スコア, 予測単語列, 一個前の予測単語, decLSTMに渡すlstmのstate, decLSTMに入るinputEmbじゃない方(attしてるやつ), フィルター(出力単語を一部制御))
     return beam
 
@@ -311,6 +303,9 @@ def BeamDecording(model, encSent, decDict, decDictR, args): #1文ずつ処理し
 def rerankingByLengthNormalizedLoss(beam, wposi):
     beam.sort(key=lambda b: b[0] / (len(b[wposi]) - 1))
     return beam
+
+# BeamDecording(model, encSent, decDict, decDictR, args): #1文ずつ処理していく　beamの時にbatch処理になるため、
+def demo(model, encSent, decDict, decDictR, args):
     
 if __name__ == "__main__":
     """main program"""
@@ -394,8 +389,8 @@ if __name__ == "__main__":
         type=int,
         help='beam size in beam search decoding default=1')
     parser.add_argument(
-        '--decode-len'
-        dest='decode_len'
+        '--decode-len',
+        dest='decode_len',
         default=70,
         type=int,
         help='max length while decoding')
