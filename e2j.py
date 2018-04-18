@@ -304,7 +304,6 @@ def rerankingByLengthNormalizedLoss(beam, wposi):
     beam.sort(key=lambda b: b[0] / (len(b[wposi]) - 1))
     return beam
 
-# BeamDecording(model, encSent, decDict, decDictR, args): #1文ずつ処理していく　beamの時にbatch処理になるため、
 def demo(model, encSents, decSents, encDictR, decDict, decDictR, args):
     for encSent, decSent in zip(encSents, decSents):
         print("Ques", " ".join([encDictR[z] if z != 0 else "<unk>" for z in encSent.tolist()]))
@@ -313,9 +312,15 @@ def demo(model, encSents, decSents, encDictR, decDict, decDictR, args):
         for i, b in enumerate(beam):
             print("pred", i, b[0], "".join([decDictR[z] if z != 0 else "<unk>" for z in b[1]]))
         print("----------------------------------------------------")
-            
-            
-            
+
+def test(model, encSents, decDict, decDictR, args):
+    F = open(args.outputFile, "w")
+    for encSent in encSents:
+        beam = BeamDecording(model, encSent, decDict, args)
+        b = beam[0][1][1:-1]
+        F.write("{}\n".format(" ".join(decDictR[z] if z != 0 else "<unk>" for z in b)))
+    F.close()
+        
     
 if __name__ == "__main__":
     """main program"""
@@ -350,7 +355,7 @@ if __name__ == "__main__":
         '-E',
         '--epoch',
         dest='epoch',
-        default=13,
+        default=20,
         type=int,
         help='number of epoch [int] default=13')
     parser.add_argument(
@@ -404,6 +409,11 @@ if __name__ == "__main__":
         default=70,
         type=int,
         help='max length while decoding')
+    parser.add_argument(
+        '--output-file',
+        dest='outputFile',
+        default='result.txt',
+        help='test output')
         
     print("start")
     args = parser.parse_args()
@@ -459,17 +469,25 @@ if __name__ == "__main__":
     trainer.extend(extensions.ProgressBar(update_interval=1))
     trainer.run()
     ##### ここから下はupdaterに書くことになるかもな TODO
-    es = [xp.array(x[0], dtype=xp.int32) for x in batch]
-    ds = [xp.array(x[1], dtype=xp.int32) for x in batch]
+    # es = [xp.array(x[0], dtype=xp.int32) for x in batch]
+    # ds = [xp.array(x[1], dtype=xp.int32) for x in batch]
 
-    encEmbed = model.getEmbeddings(es, args)
-    hy, cy, ys = model.encNStepLSTM(hx=None, cx=None, xs=encEmbed)
-    decEmbed = F.pad_sequence(model.getEmbeddings(ds, args)).transpose([1, 0, 2])
+    # encEmbed = model.getEmbeddings(es, args)
+    # hy, cy, ys = model.encNStepLSTM(hx=None, cx=None, xs=encEmbed)
+    # decEmbed = F.pad_sequence(model.getEmbeddings(ds, args)).transpose([1, 0, 2])
     
-    loss, result = model.trainBatch(es, ds, args)
-
+    # loss, result = model.trainBatch(es, ds, args)
+    
+    print("train finish")
+    if 1:
+        locate = "result/300ktrain_other_def"
+        serializers.save_npz(locate, model)
+        print(locate, "save finish")
+    esd = [xp.array(x, dtype=xp.int32) for x in encSentListDev]
+    test(model, esd, decDict, decDictR, args)
     print("Fin")
-            
+
+    
 def train_model(args):
     return 0
 
