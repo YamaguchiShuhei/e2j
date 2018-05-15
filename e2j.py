@@ -30,6 +30,10 @@ class EncoderDecoder(chainer.Chain):
             if args.attention:
                 self.attnIn = L.Linear(args.hiddenDim, args.hiddenDim, nobias=True)
                 self.attnOut = L.Linear(args.hiddenDim+args.hiddenDim, args.hiddenDim, nobias=True)
+        self.encDict = {}
+        self.encDictR = {}
+        self.decDict = {}
+        self.decDictR = {}
 
     def trainBatch(self, encSents, decSents, args):
         """main training"""
@@ -313,6 +317,12 @@ def demo(model, encSents, decSents, encDictR, decDict, decDictR, args):
             print("pred", i, b[0], "".join([decDictR[z] if z != 0 else "<unk>" for z in b[1]]))
         print("----------------------------------------------------")
 
+def e2j_demo(model, text, encDict, decDict, decDictR, args):
+    encSent = xp.array([encDict[w] if w in encDict else 0 for w in text.split()], dtype = xp.int32)
+    beam = BeamDecording(model, encSent, decDict, args)
+    return "".join([decDictR[z] if z != 0 else "<unk>" for z in beam[0][1]])
+    
+
 def test(model, encSents, decDict, decDictR, args):
     F = open(args.outputFile, "w")
     for encSent in encSents:
@@ -355,7 +365,7 @@ if __name__ == "__main__":
         '-E',
         '--epoch',
         dest='epoch',
-        default=20,
+        default=2,
         type=int,
         help='number of epoch [int] default=13')
     parser.add_argument(
@@ -469,9 +479,11 @@ if __name__ == "__main__":
     trainer.extend(extensions.ProgressBar(update_interval=1))
     trainer.run()
     ##### ここから下はupdaterに書くことになるかもな TODO
-    # es = [xp.array(x[0], dtype=xp.int32) for x in batch]
-    # ds = [xp.array(x[1], dtype=xp.int32) for x in batch]
+    es = [xp.array(x[0], dtype=xp.int32) for x in batch]
+    ds = [xp.array(x[1], dtype=xp.int32) for x in batch]
 
+    serializers.save_npz("result/300k_train_otherdefepoch2", model)
+    trainer.run()
     # encEmbed = model.getEmbeddings(es, args)
     # hy, cy, ys = model.encNStepLSTM(hx=None, cx=None, xs=encEmbed)
     # decEmbed = F.pad_sequence(model.getEmbeddings(ds, args)).transpose([1, 0, 2])
@@ -479,12 +491,12 @@ if __name__ == "__main__":
     # loss, result = model.trainBatch(es, ds, args)
     
     print("train finish")
-    if 1:
-        locate = "result/300ktrain_other_def"
-        serializers.save_npz(locate, model)
-        print(locate, "save finish")
-    esd = [xp.array(x, dtype=xp.int32) for x in encSentListDev]
-    test(model, esd, decDict, decDictR, args)
+    # if 1:
+    #     locate = "result/300ktrain_other_def"
+    #     serializers.save_npz(locate, model)
+    #     print(locate, "save finish")
+    # esd = [xp.array(x, dtype=xp.int32) for x in encSentListDev]
+    # test(model, esd, decDict, decDictR, args)
     print("Fin")
 
     
